@@ -1,0 +1,164 @@
+# Central Graphify runner.
+#
+# Lives in a SEPARATE "runner" repository you own (see ../../README.md), not in the repositories it analyses.
+# Triggered only by workflow_dispatch (by the CodeLens `generate_graphify` tool): it checks out ANY public GitHub repository
+# at an exact commit, runs Graphify on it and uploads graph.json + source_commit.txt as one artifact.
+#
+# Security model: the target repository's code is UNTRUSTED.
+#   * No secrets are referenced anywhere in this file.
+#   * The workflow token has `contents: read` only, is used only by the trusted validation/checkout steps, and is not
+#     persisted into the checkout (persist-credentials: false).
+#   * Inputs are never interpolated into shell code: they are passed through `env:` and validated with strict patterns first.
+#   * Graphify runs in a step whose environment is scrubbed (`env -i`), so nothing from the runner environment is visible to it.
+#   * Hard timeouts on the job and on the step that touches untrusted code.
+name: Graphify runner
+run-name: graphify ${{ inputs.request_id }} ${{ inputs.owner }}/${{ inputs.repo }}@${{ inputs.commit_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: "Public repository URL, https://github.com/<owner>/<repo>"
+        required: true
+        type: string
+      owner:
+        description: "Repository owner"
+        required: true
+        type: string
+      repo:
+        description: "Repository name"
+        required: true
+        type: string
+      commit_sha:
+        description: "Exact 40-character commit SHA to analyse"
+        required: true
+        type: string
+      request_id:
+        description: "Caller-chosen id (8-64 chars of A-Z a-z 0-9 _ -); used to find this run"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: graphify-${{ inputs.owner }}-${{ inputs.repo }}-${{ inputs.commit_sha }}
+  cancel-in-progress: false
+
+jobs:
+  graphify:
+    name: Generate Graphify graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Validate inputs and target
+        timeout-minutes: 3
+        env:
+          REPOSITORY_URL: ${{ inputs.repository_url }}
+          TARGET_OWNER: ${{ inputs.owner }}
+          TARGET_REPO: ${{ inputs.repo }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$TARGET_OWNER" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38})$ ]] || fail "invalid owner"
+          [[ "$TARGET_REPO" =~ ^[A-Za-z0-9._-]{1,100}$ && "$TARGET_REPO" != "." && "$TARGET_REPO" != ".." ]] || fail "invalid repo"
+          [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "commit_sha must be a full 40-character lowercase hex SHA"
+          [[ "$REQUEST_ID" =~ ^[A-Za-z0-9_-]{8,64}$ ]] || fail "invalid request_id"
+          [[ "$REPOSITORY_URL" == "https://github.com/${TARGET_OWNER}/${TARGET_REPO}" ]] || fail "repository_url does not match owner/repo"
+          # Only PUBLIC repositories, and only a commit that really exists there.
+          private="$(curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}" | jq -r '.private')" || fail "repository not found or not readable"
+          [ "$private" = "false" ] || fail "repository is not public"
+          curl -fsS -o /dev/null -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/commits/${COMMIT_SHA}" || fail "commit not found in repository"
+          echo "Validated ${TARGET_OWNER}/${TARGET_REPO}@${COMMIT_SHA}"
+
+      - name: Check out the target repository at the exact commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.owner }}/${{ inputs.repo }}
+          ref: ${{ inputs.commit_sha }}
+          path: target
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Confirm the checked-out commit
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          actual="$(git -C target rev-parse HEAD)"
+          [ "$actual" = "$COMMIT_SHA" ] || { echo "::error::checked out ${actual}, expected ${COMMIT_SHA}"; exit 1; }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Graphify (trusted step - no target code runs here)
+        timeout-minutes: 5
+        env:
+          GRAPHIFY_VERSION: ${{ vars.GRAPHIFY_VERSION }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -n "${GRAPHIFY_VERSION:-}" ]; then
+            [[ "$GRAPHIFY_VERSION" =~ ^[0-9A-Za-z.+!-]{1,40}$ ]] || { echo "::error::invalid GRAPHIFY_VERSION"; exit 1; }
+            pip install "graphifyy==${GRAPHIFY_VERSION}"
+          else
+            echo "::warning::Repository variable GRAPHIFY_VERSION is not set; installing the latest graphifyy. Pin it."
+            pip install graphifyy
+          fi
+
+      - name: Run Graphify on the untrusted source (scrubbed environment)
+        timeout-minutes: 15
+        working-directory: target
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/graphify-home"
+          rm -rf graphify-out
+          touch "${RUNNER_TEMP}/graphify.start"
+          sleep 1
+          # env -i: the analysed code sees no GitHub/runner variables, tokens or secrets.
+          env -i PATH="${PATH}" HOME="${RUNNER_TEMP}/graphify-home" LANG=C.UTF-8 graphify update .
+
+      - name: Collect graph.json and source_commit.txt
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          graph="$(find target -type f -name graph.json -newer "${RUNNER_TEMP}/graphify.start" -print | head -n 1)"
+          [ -n "$graph" ] || { echo "::error::Graphify did not produce a graph.json"; exit 1; }
+          size="$(wc -c < "$graph")"
+          [ "$size" -le 104857600 ] || { echo "::error::graph.json is larger than 100 MB (${size} bytes)"; exit 1; }
+          python - "$graph" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          assert isinstance(data, dict) and isinstance(data.get("nodes"), list), "graph.json has no nodes list"
+          assert "links" in data or "edges" in data, "graph.json has no links/edges"
+          print(f"graph.json OK: {len(data['nodes'])} nodes")
+          PY
+          cp "$graph" out/graph.json
+          printf '%s\n' "$COMMIT_SHA" > out/source_commit.txt
+
+      - name: Upload the Graphify artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphify-${{ inputs.owner }}-${{ inputs.repo }}-${{ inputs.commit_sha }}
+          path: |
+            out/graph.json
+            out/source_commit.txt
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
